@@ -1,0 +1,11 @@
+# Corpus directories
+transcripts
+test-transcripts
+cleaned-transcripts
+cleaned-test-transcripts
+
+.env
+
+.DS_Store
+chroma_db/
+__pycache__/
