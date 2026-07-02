@@ -1,19 +1,106 @@
 import os, re, math
 import numpy as np
+from rerankers import Reranker
 
 DOCS = "cleaned-test-transcripts"
 
 
-def load_and_chunk(directory, chunk_size=500, overlap=50):
+def _char_window_chunks(text, chunk_size=500, overlap=50):
+    chunks = []
+    for s in range(0, len(text), chunk_size - overlap):
+        ct = text[s:s + chunk_size]
+        if ct.strip():
+            chunks.append({"text": ct, "start": s})
+    return chunks
+
+
+def _paragraph_spans(text):
+    spans = []
+    cursor = 0
+    for m in re.finditer(r"\n\s*\n+", text):
+        start, end = cursor, m.start()
+        if text[start:end].strip():
+            spans.append((start, end))
+        cursor = m.end()
+    if cursor < len(text) and text[cursor:].strip():
+        spans.append((cursor, len(text)))
+    return spans
+
+
+def _speaker_turn_spans(text):
+    # Basic speaker line detector (e.g., "Andrew Huberman:" / "Matt Abrahams:").
+    speaker_re = re.compile(r"^[A-Z][A-Za-z.'-]*(?: [A-Z][A-Za-z.'-]*){0,3}:\s", re.M)
+    starts = [m.start() for m in speaker_re.finditer(text)]
+    if not starts:
+        return []
+    spans = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        if text[start:end].strip():
+            spans.append((start, end))
+    return spans
+
+
+def _pack_spans(text, spans, chunk_size=500):
+    if not spans:
+        return []
+    chunks = []
+    i = 0
+    while i < len(spans):
+        start, end = spans[i]
+        # If one span is larger than chunk_size, split it by characters.
+        if end - start > chunk_size:
+            for s in range(start, end, chunk_size):
+                ct = text[s:min(s + chunk_size, end)]
+                if ct.strip():
+                    chunks.append({"text": ct, "start": s})
+            i += 1
+            continue
+
+        j = i + 1
+        packed_end = end
+        while j < len(spans):
+            _, next_end = spans[j]
+            if next_end - start > chunk_size:
+                break
+            packed_end = next_end
+            j += 1
+
+        ct = text[start:packed_end]
+        if ct.strip():
+            chunks.append({"text": ct, "start": start})
+        i = j
+
+    return chunks
+
+
+def _structured_chunks(text, chunk_size=500, strategy="paragraph"):
+    if strategy == "paragraph":
+        spans = _paragraph_spans(text)
+    elif strategy == "speaker":
+        spans = _speaker_turn_spans(text)
+        if not spans:
+            spans = _paragraph_spans(text)
+    else:
+        raise ValueError(f"Unknown structured chunking strategy: {strategy}")
+    return _pack_spans(text, spans, chunk_size=chunk_size)
+
+
+def load_and_chunk(directory, chunk_size=500, overlap=50, chunking="char"):
     chunks = []
     for fn in sorted(os.listdir(directory)):
         if not fn.endswith((".txt", ".md")):
             continue
         text = open(os.path.join(directory, fn)).read()
-        for s in range(0, len(text), chunk_size - overlap):
-            ct = text[s:s + chunk_size]
-            if ct.strip():
-                chunks.append({"text": ct, "source": fn, "start": s})
+        if chunking == "char":
+            file_chunks = _char_window_chunks(text, chunk_size=chunk_size, overlap=overlap)
+        elif chunking in ("paragraph", "speaker"):
+            file_chunks = _structured_chunks(text, chunk_size=chunk_size, strategy=chunking)
+        else:
+            raise ValueError(f"Unknown chunking mode: {chunking}")
+
+        for c in file_chunks:
+            chunks.append({"text": c["text"], "source": fn, "start": c["start"]})
     return chunks
 
 
@@ -61,8 +148,8 @@ def embed_chunks(chunks, model):
     return model.encode([c["text"] for c in chunks], show_progress_bar=True)
 
 
-def build_corpus(directory, chunk_size=500, ngram=1):
-    chunks = load_and_chunk(directory, chunk_size=chunk_size)
+def build_corpus(directory, chunk_size=500, ngram=1, overlap=50, chunking="char"):
+    chunks = load_and_chunk(directory, chunk_size=chunk_size, overlap=overlap, chunking=chunking)
     model = Embedder(ngram=ngram).fit([c["text"] for c in chunks])
     return chunks, embed_chunks(chunks, model), model
 
@@ -77,6 +164,32 @@ def make_retriever(chunks, embeddings, model):
 
 def top_similarity(query, embeddings, model):
     return float(np.max(embeddings @ model.encode([query])[0]))
+
+
+def make_reranked_retriever(chunks, embeddings, model, reranker=None, retrieve_k=50):
+    """
+    Create a two-stage retriever: first retrieve top `retrieve_k` candidates via bi-encoder,
+    then rerank them with a cross-encoder and return top results.
+    """
+    base_retriever = make_retriever(chunks, embeddings, model)
+    
+    def retrieve_and_rerank(query, k):
+        # Stage 1: retrieve top retrieve_k candidates
+        candidates = base_retriever(query, retrieve_k)
+        candidate_chunks = [chunks[i]["text"] for i in candidates]
+        
+        if not reranker:
+            return candidates[:k]
+        
+        # Stage 2: rerank candidates using cross-encoder
+        # Pass explicit doc_ids so reranked results can be mapped back to candidate offsets.
+        ranked = reranker.rank(query, candidate_chunks, doc_ids=list(range(len(candidate_chunks))))
+        top_results = ranked.top_k(k)
+        reranked_indices = [candidates[int(r.document.doc_id)] for r in top_results]
+        
+        return reranked_indices
+    
+    return retrieve_and_rerank
 
 
 def precision_at_k(retrieved, relevant):
@@ -304,7 +417,7 @@ if __name__ == "__main__":
 
     print_eval_set(eval_set, chunks)
 
-    baseline = evaluate_retrieval(eval_set, retrieve, k=5)
+    baseline = evaluate_retrieval(eval_set, retrieve, k=10)
     print_report(baseline, "Baseline (in-corpus queries):")
     print_per_query(baseline)
 
@@ -333,3 +446,56 @@ if __name__ == "__main__":
         c, e, m = build_corpus(DOCS, ngram=ng)
         r = evaluate_retrieval(build_eval_set(c), make_retriever(c, e, m), k=5)
         print(f"  {name:<12} P@5={r['avg_precision']:.3f} R@5={r['avg_recall']:.3f} MRR={r['mrr']:.3f}")
+
+    # Experiment 4: chunk_size x chunking-strategy grid.
+    # Earlier experiments varied one dial at a time with the others left at defaults,
+    # which can hide interactions: the best chunk size for fixed-char windows is not
+    # necessarily best for paragraph/speaker chunking, since each produces differently
+    # shaped chunks. Here we hold the winning embedder fixed (ngram=1) and evaluate at a
+    # single cutoff (k=5) so every cell is comparable, then sweep chunk_size x chunking
+    # together. We report Pn@k and MRR (early-rank quality) plus chunk count, since a
+    # strategy that simply makes more chunks can move metrics for reasons unrelated to
+    # chunk quality.
+    print("\nExperiment 4: chunk_size x chunking strategy (ngram=1, k=5)")
+    print(f"  {'chunking':<14}{'size':>6}{'chunks':>8}{'P@5':>7}{'Pn@5':>7}{'R@5':>7}{'MRR':>7}")
+    for chunking in ["char", "paragraph", "speaker"]:
+        for cs in [256, 500]:
+            c, e, m = build_corpus(DOCS, chunk_size=cs, ngram=1, overlap=50, chunking=chunking)
+            r = evaluate_retrieval(build_eval_set(c), make_retriever(c, e, m), k=5)
+            print(f"  {chunking:<14}{cs:>6}{len(c):>8}{r['avg_precision']:>7.3f}"
+                  f"{r['avg_normalized_precision']:>7.3f}{r['avg_recall']:>7.3f}{r['mrr']:>7.3f}")
+
+    # Experiment 5: two-stage retrieval with cross-encoder reranking.
+    # The baseline retriever (TF-IDF bi-encoder) excels at direct lookups (rank 1)
+    # but buries answers in detail_buried queries (low MRR despite Pn@k=1.0).
+    # A cross-encoder reranker re-scores the top-50 candidates by reading query+chunk
+    # jointly, which should lift MRR on buried queries without changing what gets retrieved.
+    # We use the best baseline config (char, size=256) and compare with reranker.
+    print("\nExperiment 5: cross-encoder reranking (baseline char/256 vs reranked)")
+    c, e, m = build_corpus(DOCS, chunk_size=256, ngram=1, overlap=50, chunking="char")
+    eval_set_exp5 = build_eval_set(c)
+    baseline_retrieve = make_retriever(c, e, m)
+    
+    # Baseline (no reranking)
+    baseline_res = evaluate_retrieval(eval_set_exp5, baseline_retrieve, k=5)
+    
+    # With reranking: initialize the reranker (uses a pre-trained cross-encoder)
+    try:
+        reranker = Reranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+        reranked_retrieve = make_reranked_retriever(c, e, m, reranker=reranker, retrieve_k=50)
+        reranked_res = evaluate_retrieval(eval_set_exp5, reranked_retrieve, k=5)
+        
+        print(f"  {'Stage':<20}{'P@5':>7}{'Pn@5':>7}{'R@5':>7}{'MRR':>7}")
+        print(f"  {'Baseline (bi-enc)':<20}{baseline_res['avg_precision']:>7.3f}"
+              f"{baseline_res['avg_normalized_precision']:>7.3f}"
+              f"{baseline_res['avg_recall']:>7.3f}{baseline_res['mrr']:>7.3f}")
+        print(f"  {'+ Reranker':<20}{reranked_res['avg_precision']:>7.3f}"
+              f"{reranked_res['avg_normalized_precision']:>7.3f}"
+              f"{reranked_res['avg_recall']:>7.3f}{reranked_res['mrr']:>7.3f}")
+        print(f"  MRR gain: {reranked_res['mrr'] - baseline_res['mrr']:+.3f}")
+        
+        print("\n  By query type (reranker):")
+        print_by_type(reranked_res)
+    except Exception as e:
+        print(f"  Reranker initialization failed: {e}")
+        print(f"  (This is OK; reranker may need a GPU or model download on first run)")
